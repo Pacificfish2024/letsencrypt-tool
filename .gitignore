@@ -137,3 +137,6 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+/.vs/letsencrypt-tool.slnx
+/.vscode
+/obj/Debug

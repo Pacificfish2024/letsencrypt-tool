@@ -1,0 +1,18 @@
+{
+  "name": "letsencrypt-dns-tool",
+  "version": "1.0.0",
+  "description": "Let's Encrypt certificate tool with manual DNS verification",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "build": ""
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "acme-client": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

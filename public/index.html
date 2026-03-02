@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Let's Encrypt 专业版自助工具</title>
+    <!-- 引入外部CSS文件 -->
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="container">
+    <div class="main-area">
+        <div class="card">
+            <h1>🛡️ Let's Encrypt 专业版自助工具</h1>
+            <p style="color: #64748b; margin-bottom: 20px;">支持多域名、泛域名。提供标准 .crt/.key 文件下载及在线预览。</p>
+
+            <!-- 步骤 1: 配置 -->
+            <div id="step-config">
+                <div class="form-group">
+                    <label>联系邮箱</label>
+                    <input type="text" id="emails" placeholder="admin@example.com" autocomplete="email">
+                </div>
+
+                <div class="form-group">
+                    <label>域名列表 (每行一个)</label>
+                    <textarea id="domains" rows="4" placeholder="example.com&#10;www.example.com&#10;*.example.com"></textarea>
+                    <div class="hint"><span id="domain-count">0</span>/100 个域名 • 支持泛域名 (如 *.example.com)</div>
+                    <div id="wildcard-alert" class="alert-box">⚠️ 检测到泛域名！已自动切换为 DNS-01 验证方式</div>
+                </div>
+
+                <!-- 🔧 修复复选框：语义化label + 精确点击区域 -->
+                <label class="checkbox-group" for="isRenewal">
+                    <input type="checkbox" id="isRenewal">
+                    <span>这是续期申请 (Renewal)</span>
+                </label>
+                <div class="hint" style="margin-top:6px; margin-left: 32px; padding-left: 4px; border-left: 2px solid #cbd5e1;">
+                    ℹ️ 勾选后将显示私钥输入框。粘贴旧私钥可复用（推荐），留空则生成新私钥（同样有效）
+                </div>
+                
+                <div id="renewal-input-container" class="renewal-input-box">
+                    <label style="font-size: 0.92rem; font-weight: 600; margin-bottom: 8px; display: block; color: #1e293b;">🔑 旧私钥内容 (PEM格式，可选)</label>
+                    <textarea id="oldPrivateKey" rows="6" placeholder="-----BEGIN PRIVATE KEY-----&#10;MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC...&#10;-----END PRIVATE KEY-----"></textarea>
+                    <div class="hint" style="margin-top:8px; background:#fff9db; padding:8px; border-radius:6px; border-left:2px solid #f5c43d;">
+                        <strong>注意：</strong>仅当内容为有效PEM私钥时才会被使用（需包含"-----BEGIN PRIVATE KEY-----"）。格式错误将自动忽略并生成新密钥。
+                    </div>
+                </div>
+
+                <div class="grid-2" style="margin-top: 18px;">
+                    <div class="form-group">
+                        <label>验证方式</label>
+                        <select id="mode">
+                            <option value="http-01">HTTP-01 (上传验证文件)</option>
+                            <option value="dns-01">DNS-01 (添加TXT记录)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>环境</label>
+                        <select id="envType">
+                            <option value="production">Production (生产环境)</option>
+                            <option value="staging">Staging (测试环境)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <details>
+                    <summary>⚙️ 高级选项 (密钥算法)</summary>
+                    <div class="form-group" style="margin-top: 15px;">
+                        <select id="keyType">
+                            <option value="rsa-2048">RSA 2048 (默认/兼容性最佳)</option>
+                            <option value="rsa-3072">RSA 3072 (更高安全性)</option>
+                            <option value="ecdsa-p256">ECDSA P-256 (性能最优/证书更小)</option>
+                        </select>
+                        <div class="hint" style="margin-top:8px; padding:10px; background:#f0f9ff; border-radius:6px; border-left:3px solid var(--primary);">
+                            <strong>重要提示：</strong>若提供了有效旧私钥，此设置将被忽略，系统自动沿用原密钥算法。
+                        </div>
+                    </div>
+                </details>
+
+                <button class="btn btn-primary" id="startBtn" style="margin-top: 24px; height: 52px; font-size: 1.1rem;">🚀 开始申请证书</button>
+                <div id="config-error" style="color: var(--danger); margin-top: 12px; font-weight: 600; display: none; padding: 10px; background: #fef2f2; border-radius: 6px; border-left: 3px solid var(--danger);"></div>
+            </div>
+
+            <!-- 步骤 2: 验证 -->
+            <div id="step-action" class="hidden">
+                <h2>🔧 请配置验证信息</h2>
+                <div id="action-info" style="background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; padding: 14px; border-radius: 8px; margin-bottom: 18px; line-height: 1.6;"></div>
+                <div id="challenge-container" class="challenge-list"></div>
+                <button class="btn btn-success" id="verifyBtn" style="margin-top: 28px; height: 52px; font-size: 1.1rem;">✅ 验证配置已完成，开始验证</button>
+                <div id="verify-msg" style="margin-top: 14px; font-size: 0.95rem; min-height: 24px; padding: 8px; border-radius: 6px;"></div>
+            </div>
+
+            <!-- 步骤 3: 成功 -->
+            <div id="step-success" class="hidden">
+                <h2 style="color: var(--success); display:flex; align-items:center; gap:12px; font-size: 1.4rem;">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+                    证书签发成功！
+                </h2>
+                <p style="color:#64748b; margin-bottom: 24px; font-size: 1.05rem;">您的证书已生成。请妥善保存私钥（.key文件），并按需部署到服务器。</p>
+                
+                <div class="cert-display">
+                    <div class="cert-section">
+                        <label style="font-size:0.95rem; font-weight:bold; display:flex; justify-content:space-between; align-items:center;">
+                            <span>📄 证书内容 (.crt)</span>
+                            <button class="btn btn-sm btn-outline" data-copy-target="cert-content">📋 复制全部</button>
+                        </label>
+                        <div class="cert-preview" id="cert-content"></div>
+                    </div>
+
+                    <div class="cert-section">
+                        <label style="font-size:0.95rem; font-weight:bold; display:flex; justify-content:space-between; align-items:center; color: var(--danger);">
+                            <span>🔑 私钥内容 (.key) - <strong>请严格保密！</strong></span>
+                            <button class="btn btn-sm btn-outline" data-copy-target="key-content">📋 复制全部</button>
+                        </label>
+                        <div class="cert-preview" id="key-content" style="color:#f87171;"></div>
+                    </div>
+                </div>
+
+                <div class="btn-group">
+                    <a id="download-cert-btn" class="btn btn-primary" href="#" download>📥 下载证书 (.crt)</a>
+                    <a id="download-key-btn" class="btn btn-outline" href="#" download>🔒 下载私钥 (.key)</a>
+                </div>
+                
+                <div class="hint" style="margin-top: 20px; text-align: center; background: #f1f5f9; padding: 14px; border-radius: 10px; border: 1px solid #e2e8f0;">
+                    💡 <strong>Nginx 配置示例：</strong><br>
+                    <code style="background:#e2e8f0; padding:3px 6px; border-radius:4px; margin:0 2px; font-family:monospace; font-size:0.9rem;">ssl_certificate /path/to/domain.crt;</code><br>
+                    <code style="background:#e2e8f0; padding:3px 6px; border-radius:4px; margin:0 2px; font-family:monospace; font-size:0.9rem;">ssl_certificate_key /path/to/domain.key;</code>
+                </div>
+
+                <button class="btn" style="background: #e2e8f0; color: #334155; margin-top: 24px; height: 48px;" onclick="location.reload()">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:6px;"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3"></path></svg>
+                    申请新证书
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 日志面板 -->
+    <div class="log-panel">
+        <div class="log-header">
+            <span>📜 实时进度日志</span>
+            <span id="status-badge" class="status-badge st-wait">等待开始</span>
+        </div>
+        <div class="log-content" id="log-box">
+            <div style="text-align: center; color: #94a3b8; margin-top: 100px; opacity: 0.85; padding: 0 20px;">
+                <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-bottom:16px; opacity: 0.7;">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                    <polyline points="10 9 9 9 8 9"></polyline>
+                </svg>
+                <div style="font-size: 1.3rem; font-weight: 600; margin-bottom: 10px;">等待配置参数</div>
+                <div style="font-size: 1.05rem; line-height: 1.6;">填写域名和邮箱后，点击"开始申请证书"按钮启动流程</div>
+                <div style="margin-top: 20px; padding: 12px; background: rgba(56,189,248,0.15); border-radius: 8px; border: 1px solid #0ea5e9; font-size: 0.95rem;">
+                    💡 <strong>提示：</strong>泛域名（*.example.com）必须使用 DNS-01 验证方式
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 引入外部JS文件（放在body末尾确保DOM加载完成） -->
+<script src="js/main.js"></script>
+</body>
+</html>

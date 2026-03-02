@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="letsencrypt-tool.esproj">
+    <Build />
+    <Deploy />
+  </Project>
+</Solution>
