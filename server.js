@@ -1,6 +1,8 @@
 const express = require('express');
 const acme = require('acme-client');
 const crypto = require('crypto');
+// 🔧 修改：引入 serverless-http 适配 ESA 函数
+const serverless = require('serverless-http');
 
 // ✅ 尝试直接引用 node-forge (acme-client 的依赖)
 let forge;
@@ -11,15 +13,17 @@ try {
 }
 
 const app = express();
-const PORT = process.env.PORT || 80;
+// 🔧 修改：删除 PORT 硬编码（ESA 函数无需监听端口）
+// const PORT = process.env.PORT || 80;
 
 app.use(express.json({ limit: '2mb' }));
-app.use(express.static('public'));
+// 🔧 修改：静态文件交由 ESA Pages 托管，注释掉静态文件中间件
+// app.use(express.static('public'));
 
 // ================= 配置与存储 =================
-const SESSION_TIMEOUT = 45 * 60 * 1000; 
-const CLEANUP_INTERVAL = 5 * 60 * 1000; 
-const MAX_CONCURRENT_TASKS = 5; 
+const SESSION_TIMEOUT = 45 * 60 * 1000;
+const CLEANUP_INTERVAL = 5 * 60 * 1000;
+const MAX_CONCURRENT_TASKS = 5;
 
 const sessions = new Map();
 let activeTasks = 0;
@@ -32,7 +36,7 @@ function createSessionId() {
 function log(session, type, current, next = null, details = null) {
     const entry = { ts: new Date().toISOString(), type, current, next, details };
     session.logs.push(entry);
-    if (session.logs.length > 200) session.logs.shift(); 
+    if (session.logs.length > 200) session.logs.shift();
 }
 
 function validateDomain(domain) {
@@ -129,7 +133,7 @@ function generateCsrManual(domains, privateKeyPem, keyType) {
                 name: 'commonName',
                 value: domains[0]
             }];
-            
+
             if (domains.length > 1) {
                 attrs.push({
                     name: 'subjectAltName',
@@ -161,7 +165,7 @@ app.post('/api/create-session', async (req, res) => {
 
     if (!domains || domains.length === 0) return res.status(400).json({ error: '至少需要一个域名' });
     if (domains.length > 100) return res.status(400).json({ error: '最多支持 100 个域名' });
-    
+
     const cleanDomains = domains.map(d => d.trim().toLowerCase()).filter(d => d);
     for (const d of cleanDomains) {
         if (!validateDomain(d)) return res.status(400).json({ error: `域名格式无效: ${d}` });
@@ -203,7 +207,7 @@ app.post('/api/create-session', async (req, res) => {
             log(session, 'step', '开始处理 (队列就绪)', '连接 ACME 服务器...');
 
             const directoryUrl = isStaging ? acme.directory.letsencrypt.staging : acme.directory.letsencrypt.production;
-            
+
             session.client = new acme.Client({
                 directoryUrl,
                 accountKey: await acme.crypto.createPrivateKey()
@@ -216,7 +220,7 @@ app.post('/api/create-session', async (req, res) => {
             });
             log(session, 'success', '账户注册成功', '处理密钥...');
 
-            let keyObj = null; 
+            let keyObj = null;
             let privateKeyPem = null;
 
             // 1. 处理续期
@@ -304,7 +308,7 @@ app.post('/api/create-session', async (req, res) => {
                 if (!challenge) throw new Error(`域名 ${domain} 找不到 ${mode} 挑战`);
 
                 const keyAuth = await session.client.getChallengeKeyAuthorization(challenge);
-                
+
                 challengesToSolve.push({
                     domain, type: mode, token: challenge.token, keyAuthorization: keyAuth,
                     challengeObj: challenge, authorizationObj: auth,
@@ -381,13 +385,14 @@ app.get('/api/session/:id', (req, res) => {
     if (!s) return res.status(404).json({ error: 'Not found' });
     let pemKey = null;
     if (s.privateKeyObject) {
-        try { pemKey = s.privateKeyObject.export({ format: 'pem', type: 'pkcs8' }); } 
+        try { pemKey = s.privateKeyObject.export({ format: 'pem', type: 'pkcs8' }); }
         catch (e) { try { pemKey = s.privateKeyObject.export({ format: 'pem' }); } catch (e2) { pemKey = "Error"; } }
     }
     res.json({ status: s.status, logs: s.logs, config: s.config, hasCert: !!s.certificate, certificate: s.certificate, privateKey: pemKey, challenges: s.challengeData });
 });
 
-app.get('/download/cert/:id', (req, res) => {
+app.get('/api/download/cert/:id', (req, res) => {
+    // 🔧 修改：下载接口路径添加 /api 前缀，统一路由规则
     const s = sessions.get(req.params.id);
     if (!s || !s.certificate) return res.status(404).send('Not Found');
     res.setHeader('Content-Type', 'application/x-x509-ca-cert');
@@ -395,20 +400,35 @@ app.get('/download/cert/:id', (req, res) => {
     res.send(s.certificate);
 });
 
-app.get('/download/key/:id', (req, res) => {
+app.get('/api/download/key/:id', (req, res) => {
+    // 🔧 修改：下载接口路径添加 /api 前缀，统一路由规则
     const s = sessions.get(req.params.id);
     if (!s || !s.privateKeyObject) return res.status(404).send('Not Found');
     let pemKey;
-    try { pemKey = s.privateKeyObject.export({ format: 'pem', type: 'pkcs8' }); } 
+    try { pemKey = s.privateKeyObject.export({ format: 'pem', type: 'pkcs8' }); }
     catch (e) { pemKey = s.privateKeyObject.export({ format: 'pem' }); }
     res.setHeader('Content-Type', 'application/x-pem-file');
     res.setHeader('Content-Disposition', `attachment; filename="${s.config.domains[0].replace(/[^a-z0-9]/gi, '_')}.key"`);
     res.send(pemKey);
 });
 
-app.listen(PORT, () => {
-    console.log(`🔒 Production LE Tool Running on ${PORT}`);
-    console.log(`✅ Fixed: Variable redeclaration error in CSR generation`);
-    if (!forge) console.log(`⚠️  WARNING: node-forge not found.`);
-    else console.log(`✅ node-forge loaded successfully.`);
-});
+// 🔧 修改：删除 app.listen（ESA 函数无需监听端口）
+// app.listen(PORT, () => {
+//     console.log(`🔒 Production LE Tool Running on ${PORT}`);
+//     console.log(`✅ Fixed: Variable redeclaration error in CSR generation`);
+//     if (!forge) console.log(`⚠️  WARNING: node-forge not found.`);
+//     else console.log(`✅ node-forge loaded successfully.`);
+// });
+
+// 🔧 修改：导出 Serverless 函数（ESA 函数入口）
+module.exports.handler = serverless(app);
+
+// 🔧 修改：兼容本地开发（本地仍可运行 node server.js）
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`🔧 本地开发模式启动：http://localhost:${PORT}`);
+        if (!forge) console.log(`⚠️  WARNING: node-forge not found.`);
+        else console.log(`✅ node-forge loaded successfully.`);
+    });
+}
