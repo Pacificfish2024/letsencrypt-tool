@@ -8,13 +8,14 @@
     <PackageJsonScriptsStart Condition="$(PackageJsonScriptsStart) == ''">node server.js</PackageJsonScriptsStart>
     <PackageJsonScriptsDev Condition="$(PackageJsonScriptsDev) == ''">node server.js</PackageJsonScriptsDev>
     <PackageJsonScriptsBuild Condition="$(PackageJsonScriptsBuild) == ''">echo 'No build required for Node.js server'</PackageJsonScriptsBuild>
-    <PackageJsonDependenciesExpress Condition="$(PackageJsonDependenciesExpress) == ''">^4.21.0</PackageJsonDependenciesExpress>
     <PackageJsonDependenciesAcmeClient Condition="$(PackageJsonDependenciesAcmeClient) == ''">^5.4.0</PackageJsonDependenciesAcmeClient>
+    <PackageJsonDependenciesExpress Condition="$(PackageJsonDependenciesExpress) == ''">^4.21.0</PackageJsonDependenciesExpress>
     <PackageJsonDependenciesNodeForge Condition="$(PackageJsonDependenciesNodeForge) == ''">^1.3.1</PackageJsonDependenciesNodeForge>
     <PackageJsonDependenciesServerlessHttp Condition="$(PackageJsonDependenciesServerlessHttp) == ''">^3.2.0</PackageJsonDependenciesServerlessHttp>
-    <PackageJsonOptionaldependenciesTencentcloudSdkNodejsTeo Condition="$(PackageJsonOptionaldependenciesTencentcloudSdkNodejsTeo) == ''">^4.0.1000</PackageJsonOptionaldependenciesTencentcloudSdkNodejsTeo>
     <PackageJsonOptionaldependenciesAlicloudEsaKvSdk Condition="$(PackageJsonOptionaldependenciesAlicloudEsaKvSdk) == ''">^1.0.0</PackageJsonOptionaldependenciesAlicloudEsaKvSdk>
     <PackageJsonOptionaldependenciesOctokitRest Condition="$(PackageJsonOptionaldependenciesOctokitRest) == ''">^21.0.0</PackageJsonOptionaldependenciesOctokitRest>
+    <PackageJsonOptionaldependenciesTencentcloudSdkNodejsTeo Condition="$(PackageJsonOptionaldependenciesTencentcloudSdkNodejsTeo) == ''">^4.0.1000</PackageJsonOptionaldependenciesTencentcloudSdkNodejsTeo>
     <PackageJsonEnginesNode Condition="$(PackageJsonEnginesNode) == ''">&gt;=16.0.0</PackageJsonEnginesNode>
+    <PackageJsonDevdependenciesEslint Condition="$(PackageJsonDevdependenciesEslint) == ''">^10.0.2</PackageJsonDevdependenciesEslint>
   </PropertyGroup>
 </Project>
