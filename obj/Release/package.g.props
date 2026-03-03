@@ -7,7 +7,10 @@
     <PackageJsonMain Condition="$(PackageJsonMain) == ''">server.js</PackageJsonMain>
     <PackageJsonScriptsStart Condition="$(PackageJsonScriptsStart) == ''">node server.js</PackageJsonScriptsStart>
     <PackageJsonScriptsDev Condition="$(PackageJsonScriptsDev) == ''">node server.js</PackageJsonScriptsDev>
-    <PackageJsonScriptsBuild Condition="$(PackageJsonScriptsBuild) == ''">echo 'No build required for Node.js server'</PackageJsonScriptsBuild>
+    <PackageJsonScriptsBuild Condition="$(PackageJsonScriptsBuild) == ''">node esbuild.config.js</PackageJsonScriptsBuild>
+    <PackageJsonScriptsBuildEsa Condition="$(PackageJsonScriptsBuildEsa) == ''">esbuild server.js --platform=node --target=node16 --format=cjs --bundle --external:crypto --external:fs --external:path --external:events --external:net --external:util --outfile=dist/index.js</PackageJsonScriptsBuildEsa>
+    <PackageJsonScriptsClean Condition="$(PackageJsonScriptsClean) == ''">rm -rf dist node_modules</PackageJsonScriptsClean>
+    <PackageJsonScriptsLint Condition="$(PackageJsonScriptsLint) == ''">eslint server.js</PackageJsonScriptsLint>
     <PackageJsonDependenciesAcmeClient Condition="$(PackageJsonDependenciesAcmeClient) == ''">^5.4.0</PackageJsonDependenciesAcmeClient>
     <PackageJsonDependenciesExpress Condition="$(PackageJsonDependenciesExpress) == ''">^4.21.0</PackageJsonDependenciesExpress>
     <PackageJsonDependenciesNodeForge Condition="$(PackageJsonDependenciesNodeForge) == ''">^1.3.1</PackageJsonDependenciesNodeForge>
@@ -15,7 +18,25 @@
     <PackageJsonOptionaldependenciesAlicloudEsaKvSdk Condition="$(PackageJsonOptionaldependenciesAlicloudEsaKvSdk) == ''">^1.0.0</PackageJsonOptionaldependenciesAlicloudEsaKvSdk>
     <PackageJsonOptionaldependenciesOctokitRest Condition="$(PackageJsonOptionaldependenciesOctokitRest) == ''">^21.0.0</PackageJsonOptionaldependenciesOctokitRest>
     <PackageJsonOptionaldependenciesTencentcloudSdkNodejsTeo Condition="$(PackageJsonOptionaldependenciesTencentcloudSdkNodejsTeo) == ''">^4.0.1000</PackageJsonOptionaldependenciesTencentcloudSdkNodejsTeo>
-    <PackageJsonEnginesNode Condition="$(PackageJsonEnginesNode) == ''">&gt;=16.0.0</PackageJsonEnginesNode>
+    <PackageJsonDevdependenciesEsbuild Condition="$(PackageJsonDevdependenciesEsbuild) == ''">^0.23.1</PackageJsonDevdependenciesEsbuild>
     <PackageJsonDevdependenciesEslint Condition="$(PackageJsonDevdependenciesEslint) == ''">^10.0.2</PackageJsonDevdependenciesEslint>
+    <PackageJsonEnginesNode Condition="$(PackageJsonEnginesNode) == ''">&gt;=16.0.0</PackageJsonEnginesNode>
+    <PackageJsonKeywords Condition="$(PackageJsonKeywords) == ''">[
+  "letsencrypt",
+  "acme",
+  "ssl",
+  "certificate",
+  "dns-01",
+  "edge-function",
+  "aliyun-esa",
+  "cloudflare-workers",
+  "tencent-edgeone"
+]</PackageJsonKeywords>
+    <PackageJsonAuthor Condition="$(PackageJsonAuthor) == ''"></PackageJsonAuthor>
+    <PackageJsonLicense Condition="$(PackageJsonLicense) == ''">MIT</PackageJsonLicense>
+    <PackageJsonVoltaNode Condition="$(PackageJsonVoltaNode) == ''">16.20.2</PackageJsonVoltaNode>
+    <PackageJsonEsaBuildCommand Condition="$(PackageJsonEsaBuildCommand) == ''">npm install &amp;&amp; npm run build:esa</PackageJsonEsaBuildCommand>
+    <PackageJsonEsaBuildOutputdir Condition="$(PackageJsonEsaBuildOutputdir) == ''">dist</PackageJsonEsaBuildOutputdir>
+    <PackageJsonEsaBuildEntryfile Condition="$(PackageJsonEsaBuildEntryfile) == ''">index.js</PackageJsonEsaBuildEntryfile>
   </PropertyGroup>
 </Project>

@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "build": "echo 'No build required for Node.js server'"
+    "build": "node esbuild.config.js",
+    "build:esa": "esbuild server.js --platform=node --target=node16 --format=cjs --bundle --external:crypto --external:fs --external:path --external:events --external:net --external:util --outfile=dist/index.js",
+    "clean": "rm -rf dist node_modules",
+    "lint": "eslint server.js"
   },
   "dependencies": {
     "acme-client": "^5.4.0",
@@ -19,10 +22,34 @@
     "@octokit/rest": "^21.0.0",
     "tencentcloud-sdk-nodejs-teo": "^4.0.1000"
   },
+  "devDependencies": {
+    "esbuild": "^0.23.1",
+    "eslint": "^10.0.2"
+  },
   "engines": {
     "node": ">=16.0.0"
   },
-  "devDependencies": {
-    "eslint": "^10.0.2"
+  "keywords": [
+    "letsencrypt",
+    "acme",
+    "ssl",
+    "certificate",
+    "dns-01",
+    "edge-function",
+    "aliyun-esa",
+    "cloudflare-workers",
+    "tencent-edgeone"
+  ],
+  "author": "",
+  "license": "MIT",
+  "volta": {
+    "node": "16.20.2"
+  },
+  "esa": {
+    "build": {
+      "command": "npm install && npm run build:esa",
+      "outputDir": "dist",
+      "entryFile": "index.js"
+    }
   }
 }
