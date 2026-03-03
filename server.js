@@ -202,7 +202,7 @@ class TencentEOKV extends BaseKV {
             secretId: process.env.TENCENT_SECRET_ID,
             secretKey: process.env.TENCENT_SECRET_KEY,
             zoneId: process.env.TENCENT_ZONE_ID,
-            namespace: process.env.TENCENT_KV_NAMESPACE || 'default',
+            namespace: process.env.TENCENT_KV_NAMESPACE || 'ssl',
             region: process.env.TENCENT_REGION || 'ap-guangzhou'
         };
     }
