@@ -8,7 +8,6 @@
     <PackageJsonScriptsStart Condition="$(PackageJsonScriptsStart) == ''">node server.js</PackageJsonScriptsStart>
     <PackageJsonScriptsDev Condition="$(PackageJsonScriptsDev) == ''">node server.js</PackageJsonScriptsDev>
     <PackageJsonScriptsBuild Condition="$(PackageJsonScriptsBuild) == ''">node esbuild.config.js</PackageJsonScriptsBuild>
-    <PackageJsonScriptsBuildEsa Condition="$(PackageJsonScriptsBuildEsa) == ''">esbuild server.js --platform=node --target=node16 --format=cjs --bundle --external:crypto --external:fs --external:path --external:events --external:net --external:util --outfile=dist/index.js</PackageJsonScriptsBuildEsa>
     <PackageJsonScriptsClean Condition="$(PackageJsonScriptsClean) == ''">rm -rf dist node_modules</PackageJsonScriptsClean>
     <PackageJsonScriptsLint Condition="$(PackageJsonScriptsLint) == ''">eslint server.js</PackageJsonScriptsLint>
     <PackageJsonDependenciesAcmeClient Condition="$(PackageJsonDependenciesAcmeClient) == ''">^5.4.0</PackageJsonDependenciesAcmeClient>

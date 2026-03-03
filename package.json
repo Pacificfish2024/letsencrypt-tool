@@ -7,7 +7,6 @@
     "start": "node server.js",
     "dev": "node server.js",
     "build": "node esbuild.config.js",
-    "build:esa": "esbuild server.js --platform=node --target=node16 --format=cjs --bundle --external:crypto --external:fs --external:path --external:events --external:net --external:util --outfile=dist/index.js",
     "clean": "rm -rf dist node_modules",
     "lint": "eslint server.js"
   },
