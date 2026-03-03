@@ -1,0 +1,1 @@
+C:\Users\pacif\source\repos\letsencrypt-tool\obj\Release\letsencrypt-tool.esproj.CoreCompileInputs.cache

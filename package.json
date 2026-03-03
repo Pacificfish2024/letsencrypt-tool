@@ -1,16 +1,23 @@
 {
   "name": "letsencrypt-dns-tool",
-  "version": "1.0.0",
-  "description": "Let's Encrypt certificate tool with manual DNS verification",
+  "version": "1.1.0",
+  "description": "Let's Encrypt certificate tool with manual DNS verification, now with multi-platform KV and edge function support",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "build": ""
+    "build": "echo 'No build required for Node.js server'"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "acme-client": "^5.0.0"
+    "express": "^4.21.0",
+    "acme-client": "^5.4.0",
+    "node-forge": "^1.3.1",
+    "serverless-http": "^3.2.0"
+  },
+  "optionalDependencies": {
+    "tencentcloud-sdk-nodejs-teo": "^4.0.1000",
+    "@alicloud/esa-kv-sdk": "^1.0.0",
+    "@octokit/rest": "^21.0.0"
   },
   "engines": {
     "node": ">=16.0.0"

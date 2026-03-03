@@ -1,44 +1,273 @@
 const express = require('express');
 const acme = require('acme-client');
 const crypto = require('crypto');
+const serverless = require('serverless-http');
+const fs = require('fs').promises;
+const path = require('path');
 
-// ✅ 尝试直接引用 node-forge (acme-client 的依赖)
 let forge;
 try {
     forge = require('node-forge');
 } catch (e) {
-    console.warn("⚠️ 未找到 node-forge，CSR 生成可能在不兼容 Node v24 的环境中失败");
+    console.warn("⚠️ 未找到 node-forge，CSR 生成可能在 Node v24+ 环境中失败，执行 npm install node-forge 可修复");
 }
 
 const app = express();
-const PORT = process.env.PORT || 80;
-
+const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: '2mb' }));
-app.use(express.static('public'));
 
-// ================= 配置与存储 =================
-const SESSION_TIMEOUT = 45 * 60 * 1000;
+// ================= 运行环境检测 =================
+const RUNTIME = {
+  LOCAL: 'local', ALIYUN_ESA: 'aliyun_esa', TENCENT_EO: 'tencent_eo',
+  CLOUDFLARE: 'cloudflare', GITHUB: 'github'
+};
+
+function detectRuntime() {
+  if (typeof globalThis !== 'undefined' && globalThis.caches && globalThis.fetch && !globalThis.process) return RUNTIME.CLOUDFLARE;
+  if (typeof globalThis !== 'undefined' && globalThis.__ESA__) return RUNTIME.ALIYUN_ESA;
+  if (process.env.TENCENTCLOUD_RUNENV === 'EdgeOne') return RUNTIME.TENCENT_EO;
+  if (process.env.GITHUB_ACTIONS) return RUNTIME.GITHUB;
+  return RUNTIME.LOCAL;
+}
+
+const currentRuntime = detectRuntime();
+const isLocal = currentRuntime === RUNTIME.LOCAL;
+if (isLocal) app.use(express.static('public'));
+
+// ================= KV存储类 =================
+class BaseKV {
+    async init() { }
+    async get(key) { return null; }
+    async put(key, value, ttl = null) { return true; }
+    async delete(key) { return true; }
+    async list(prefix = '') { return []; }
+    serialize(value, ttl = null) { return JSON.stringify({ value, expireAt: ttl ? Date.now() + ttl : null, updatedAt: Date.now() }); }
+    deserialize(raw) {
+        if (!raw) return null;
+        try {
+            const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (data.expireAt && Date.now() > data.expireAt) return null;
+            return data.value;
+        } catch { return null; }
+    }
+}
+
+class NativeKV extends BaseKV {
+    constructor() {
+        super();
+        this.memoryStore = new Map();
+        this.filePath = path.join(__dirname, 'data', 'acme-kv-store.json');
+        this.useFile = !isLocal;
+    }
+    async init() {
+        if (this.useFile) {
+            const dir = path.dirname(this.filePath);
+            try { await fs.access(dir); } catch { await fs.mkdir(dir, { recursive: true }); }
+            try { await fs.access(this.filePath); } catch { await fs.writeFile(this.filePath, JSON.stringify({}), 'utf-8'); }
+        }
+    }
+    async _readFile() { const content = await fs.readFile(this.filePath, 'utf-8'); return JSON.parse(content); }
+    async _writeFile(data) { await fs.writeFile(this.filePath, JSON.stringify(data, null, 2), 'utf-8'); }
+    async get(key) { if (!this.useFile) return this.deserialize(this.memoryStore.get(key)); const store = await this._readFile(); return this.deserialize(store[key]); }
+    async put(key, value, ttl = null) { const data = this.serialize(value, ttl); if (!this.useFile) { this.memoryStore.set(key, data); return true; } const store = await this._readFile(); store[key] = data; await this._writeFile(store); return true; }
+    async delete(key) { if (!this.useFile) { this.memoryStore.delete(key); return true; } const store = await this._readFile(); delete store[key]; await this._writeFile(store); return true; }
+    async list(prefix = '') { if (!this.useFile) return Array.from(this.memoryStore.keys()).filter(k => k.startsWith(prefix)); const store = await this._readFile(); return Object.keys(store).filter(k => k.startsWith(prefix)); }
+}
+
+class CloudflareKV extends BaseKV {
+    constructor() { super(); this.kvBindingName = process.env.CF_KV_BINDING || 'ACME_KV'; this.kv = globalThis[this.kvBindingName]; }
+    async init() { if (!this.kv) throw new Error(`Cloudflare KV 绑定 ${this.kvBindingName} 不存在`); }
+    async get(key) { return this.deserialize(await this.kv.get(key)); }
+    async put(key, value, ttl = null) { await this.kv.put(key, this.serialize(value, ttl), ttl ? { expirationTtl: Math.floor(ttl / 1000) } : {}); return true; }
+    async delete(key) { await this.kv.delete(key); return true; }
+    async list(prefix = '') { const res = await this.kv.list({ prefix }); return res.keys.map(k => k.name); }
+}
+
+class TencentEOKV extends BaseKV {
+    constructor() {
+        super();
+        this.config = {
+            secretId: process.env.TENCENT_SECRET_ID, secretKey: process.env.TENCENT_SECRET_KEY,
+            zoneId: process.env.TENCENT_ZONE_ID, namespace: process.env.TENCENT_KV_NAMESPACE || 'default',
+            region: process.env.TENCENT_REGION || 'ap-guangzhou'
+        };
+    }
+    async init() {
+        if (!this.config.secretId || !this.config.secretKey || !this.config.zoneId) throw new Error('腾讯云EO KV 配置缺失');
+        try {
+            const { Client } = require('tencentcloud-sdk-nodejs-teo/TeoClient');
+            this.client = new Client({
+                credential: { secretId: this.config.secretId, secretKey: this.config.secretKey },
+                region: this.config.region,
+                profile: { httpProfile: { endpoint: 'teo.tencentcloudapi.com' } }
+            });
+        } catch (err) { throw new Error(`腾讯云EO SDK未安装: ${err.message}`); }
+    }
+    async get(key) { try { const res = await this.client.DescribeKv({ ZoneId: this.config.zoneId, Namespace: this.config.namespace, Key: key }); return this.deserialize(res.Value); } catch { return null; } }
+    async put(key, value, ttl = null) { const params = { ZoneId: this.config.zoneId, Namespace: this.config.namespace, Key: key, Value: this.serialize(value, ttl) }; if (ttl) params.ExpirationTtl = Math.floor(ttl / 1000); await this.client.ModifyKv(params); return true; }
+    async delete(key) { await this.client.DeleteKv({ ZoneId: this.config.zoneId, Namespace: this.config.namespace, Key: key }); return true; }
+    async list(prefix = '') { const res = await this.client.DescribeKvList({ ZoneId: this.config.zoneId, Namespace: this.config.namespace, Filters: prefix ? [{ Key: 'Key', Value: prefix, Operator: 'prefix' }] : [] }); return res.KvList.map(k => k.Key); }
+}
+
+class AliyunESAKV extends BaseKV {
+    constructor() {
+        super();
+        this.config = {
+            accessKeyId: process.env.ALIYUN_ACCESS_KEY_ID, accessKeySecret: process.env.ALIYUN_ACCESS_KEY_SECRET,
+            namespace: process.env.ALIYUN_KV_NAMESPACE || 'ssl', instanceId: process.env.ALIYUN_ESA_INSTANCE_ID
+        };
+    }
+    async init() {
+        if (typeof globalThis !== 'undefined' && globalThis.__KV__) { this.client = globalThis.__KV__; return; }
+        if (!this.config.accessKeyId || !this.config.accessKeySecret || !this.config.instanceId) throw new Error('阿里云ESA KV 配置缺失');
+        try {
+            const ESAClient = require('@alicloud/esa-kv-sdk');
+            this.client = new ESAClient(this.config);
+        } catch (err) { throw new Error(`阿里云ESA SDK未安装: ${err.message}`); }
+    }
+    async get(key) { try { return this.deserialize(await this.client.get(key)); } catch { return null; } }
+    async put(key, value, ttl = null) { await this.client.put(key, this.serialize(value, ttl), ttl ? { ttl: Math.floor(ttl / 1000) } : {}); return true; }
+    async delete(key) { await this.client.delete(key); return true; }
+    async list(prefix = '') { const res = await this.client.list({ prefix }); return res.keys || []; }
+}
+
+class GithubGistKV extends BaseKV {
+    constructor() {
+        super();
+        this.config = {
+            token: process.env.GITHUB_TOKEN, gistId: process.env.GITHUB_GIST_ID,
+            fileName: process.env.GITHUB_GIST_FILE || 'acme-kv-store.json'
+        };
+        this.cache = {}; this.lastSync = 0; this.syncInterval = 5000;
+    }
+    async init() {
+        if (!this.config.token) throw new Error('GitHub Token 未配置');
+        try {
+            const { Octokit } = require('@octokit/rest');
+            this.octokit = new Octokit({ auth: this.config.token });
+        } catch (err) { throw new Error(`GitHub SDK未安装: ${err.message}`); }
+        if (this.config.gistId) {
+            const { data } = await this.octokit.gists.get({ gist_id: this.config.gistId });
+            this.cache = this.deserialize(data.files[this.config.fileName]?.content) || {};
+        } else {
+            const { data } = await this.octokit.gists.create({
+                description: 'ACME KV Store', public: false,
+                files: { [this.config.fileName]: { content: this.serialize({}) } }
+            });
+            this.config.gistId = data.id;
+            console.log(`[KV] 自动创建GitHub Gist成功，ID: ${this.config.gistId}`);
+        }
+    }
+    async _sync() { if (Date.now() - this.lastSync < this.syncInterval) return; await this.octokit.gists.update({ gist_id: this.config.gistId, files: { [this.config.fileName]: { content: this.serialize(this.cache) } } }); this.lastSync = Date.now(); }
+    async get(key) { const data = this.cache[key]; if (data?.expireAt && Date.now() > data.expireAt) { delete this.cache[key]; return null; } return data?.value || null; }
+    async put(key, value, ttl = null) { this.cache[key] = { value, expireAt: ttl ? Date.now() + ttl : null, updatedAt: Date.now() }; await this._sync(); return true; }
+    async delete(key) { delete this.cache[key]; await this._sync(); return true; }
+    async list(prefix = '') { return Object.keys(this.cache).filter(k => k.startsWith(prefix)); }
+}
+
+const kvMap = {
+    [RUNTIME.CLOUDFLARE]: CloudflareKV, [RUNTIME.ALIYUN_ESA]: AliyunESAKV,
+    [RUNTIME.TENCENT_EO]: TencentEOKV, [RUNTIME.GITHUB]: GithubGistKV, [RUNTIME.LOCAL]: NativeKV
+};
+let kvInstance = null;
+async function getKV() {
+    if (kvInstance) return kvInstance;
+    try {
+        const KVClass = kvMap[currentRuntime] || NativeKV;
+        kvInstance = new KVClass();
+        await kvInstance.init();
+        console.log(`[KV] 当前运行环境: ${currentRuntime}，使用KV存储: ${KVClass.name}`);
+    } catch (err) {
+        console.warn(`[KV] ${currentRuntime} KV初始化失败，降级到原生存储: ${err.message}`);
+        kvInstance = new NativeKV();
+        await kvInstance.init();
+    }
+    return kvInstance;
+}
+
+// ================= 工具函数：网络重试、会话安全获取 =================
+async function kvOperationWithRetry(operation, maxRetries = 3, delayMs = 1000) {
+    let lastError;
+    for (let i = 0; i < maxRetries; i++) {
+        try { return await operation(); }
+        catch (err) {
+            lastError = err;
+            console.warn(`[KV重试] 操作失败 (${i + 1}/${maxRetries}):`, err.message);
+            if (i < maxRetries - 1) await new Promise(resolve => setTimeout(resolve, delayMs * (i + 1)));
+        }
+    }
+    throw lastError;
+}
+
+async function getSessionSafe(kv, sessionId, logFallback = null) {
+    try {
+        let session = await kvOperationWithRetry(() => kv.get(sessionId));
+        if (!session && logFallback) session = logFallback;
+        return session;
+    } catch (err) {
+        console.warn(`[会话获取] 重试后仍失败:`, err.message);
+        return logFallback || null;
+    }
+}
+
+// ================= 核心配置 =================
+const SESSION_TIMEOUT = 90 * 60 * 1000;
 const CLEANUP_INTERVAL = 5 * 60 * 1000;
 const MAX_CONCURRENT_TASKS = 5;
-
-const sessions = new Map();
 let activeTasks = 0;
 const taskQueue = [];
 
-function createSessionId() {
-    return `sess_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+// ================= 阶段枚举（关键修复：记录执行阶段） =================
+const STAGE = {
+    INIT: 'init',               // 初始状态
+    KEY_GEN: 'key_gen',         // 正在生成密钥
+    ACCOUNT_REG: 'account_reg', // 正在注册账户
+    ORDER_CREATE: 'order_create', // 正在创建订单
+    CHALLENGE_PREPARE: 'challenge_prepare', // 正在准备挑战
+    WAITING_USER: 'waiting_user', // 等待用户配置
+    VERIFYING: 'verifying',     // 正在验证
+    ISSUING: 'issuing',         // 正在签发证书
+    COMPLETED: 'completed',     // 完成
+    FAILED: 'failed'            // 失败
+};
+
+function createSessionId() { return `sess_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`; }
+
+// ================= 优化后的 log 函数（确保日志不丢失） =================
+async function log(sessionId, type, current, next = null, details = null) {
+    try {
+        const kv = await getKV();
+        let session = await kvOperationWithRetry(() => kv.get(sessionId));
+        if (!session) {
+            console.log(`[日志警告] 会话 ${sessionId} 不存在，跳过日志记录`);
+            return null;
+        }
+
+        const entry = { ts: new Date().toISOString(), type, current, next, details };
+        session.logs.push(entry);
+        if (session.logs.length > 200) session.logs.shift();
+        session.lastActive = Date.now();
+
+        await kvOperationWithRetry(() => kv.put(sessionId, session));
+        return session;
+    } catch (err) {
+        console.error(`[日志错误] 会话 ${sessionId}:`, err.message);
+        // 即使日志失败，也尝试直接返回会话
+        try {
+            const kv = await getKV();
+            return await kv.get(sessionId);
+        } catch {
+            return null;
+        }
+    }
 }
 
-function log(session, type, current, next = null, details = null) {
-    const entry = { ts: new Date().toISOString(), type, current, next, details };
-    session.logs.push(entry);
-    if (session.logs.length > 200) session.logs.shift();
+// ================= 简单日志记录（不更新会话，仅用于调试） =================
+function simpleLog(sessionId, message) {
+    console.log(`[${sessionId}] ${message}`);
 }
 
-function validateDomain(domain) {
-    const regex = /^(\*\.)?([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$/;
-    return regex.test(domain.toLowerCase());
-}
+function validateDomain(domain) { const regex = /^(\*\.)?([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$/; return regex.test(domain.toLowerCase()); }
 
 function getValidatedKeyObject(inputPem, expectedType) {
     try {
@@ -46,17 +275,13 @@ function getValidatedKeyObject(inputPem, expectedType) {
         const cleanPem = inputPem.trim();
         const keyObject = crypto.createPrivateKey(cleanPem);
         const details = keyObject.asymmetricKeyDetails || {};
-        if (expectedType.startsWith('rsa')) {
-            if (details.type && details.type !== 'rsa') return null;
-        } else if (expectedType === 'ecdsa-p256') {
+        if (expectedType.startsWith('rsa')) { if (details.type && details.type !== 'rsa') return null; }
+        else if (expectedType === 'ecdsa-p256') {
             if (details.type && details.type !== 'ec' && details.type !== 'ecdh') return null;
             if (details.namedCurve && details.namedCurve !== 'P-256') return null;
         }
         return keyObject;
-    } catch (err) {
-        console.log("Key validation failed:", err.message);
-        return null;
-    }
+    } catch (err) { console.log("Key validation failed:", err.message); return null; }
 }
 
 function processQueue() {
@@ -66,10 +291,7 @@ function processQueue() {
     task.run()
         .then(result => task.resolve(result))
         .catch(err => task.reject(err))
-        .finally(() => {
-            activeTasks--;
-            processQueue();
-        });
+        .finally(() => { activeTasks--; processQueue(); });
 }
 
 function enqueueTask(runner) {
@@ -79,80 +301,321 @@ function enqueueTask(runner) {
     });
 }
 
-setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    for (const [id, session] of sessions.entries()) {
-        if (now - session.lastActive > SESSION_TIMEOUT) {
-            sessions.delete(id);
-            cleaned++;
-        }
-    }
-    if (cleaned > 0) console.log(`[Cleaner] Removed ${cleaned} expired sessions.`);
-}, CLEANUP_INTERVAL);
+// ================= 会话清理逻辑 =================
+if (isLocal) {
+    setInterval(async () => {
+        const kv = await getKV();
+        const now = Date.now();
+        let cleaned = 0;
+        const sessionKeys = await kv.list('sess_');
 
-// ✅ 修复版：使用 node-forge 手动生成 CSR (强制 SHA-256)
+        for (const key of sessionKeys) {
+            const session = await kv.get(key);
+            if (!session) continue;
+            let shouldClean = false;
+            if (session.status === 'completed') shouldClean = now - session.lastActive > 7 * 24 * 60 * 60 * 1000;
+            else shouldClean = now - session.lastActive > SESSION_TIMEOUT;
+            if (shouldClean) { await kv.delete(key); cleaned++; }
+        }
+        if (cleaned > 0) console.log(`[清理任务] 移除 ${cleaned} 个过期会话`);
+    }, CLEANUP_INTERVAL);
+}
+
+// ================= CSR生成 =================
 function generateCsrManual(domains, privateKeyPem, keyType) {
     return new Promise((resolve, reject) => {
-        if (!forge) {
-            return reject(new Error("Node v24 requires 'node-forge'. Please run: npm install node-forge"));
-        }
-
+        if (!forge) return reject(new Error("Node v24+ 环境需要安装 node-forge: npm install node-forge"));
         try {
             const pki = forge.pki;
             const privateKey = pki.privateKeyFromPem(privateKeyPem);
             const csr = pki.createCertificationRequest();
-
-            // ✅ 修复变量冲突：先声明，后赋值
-            let pubKeyPem;
-            let publicKeyObj;
-
+            let pubKeyPem, publicKeyObj;
             if (keyType.startsWith('rsa')) {
-                // RSA: 尝试导出为 PKCS#1 公钥
                 const keyObj = crypto.createPrivateKey(privateKeyPem);
                 const pubKeyObjCrypto = crypto.createPublicKey(keyObj);
-                // 注意：RSA 公钥可以用 pkcs1 或 spki，forge 通常都能处理，pkcs1 更传统
                 pubKeyPem = pubKeyObjCrypto.export({ type: 'pkcs1', format: 'pem' }).toString();
             } else {
-                // EC: 必须使用 SPKI 格式
                 const keyObj = crypto.createPrivateKey(privateKeyPem);
                 const pubKeyObjCrypto = crypto.createPublicKey(keyObj);
                 pubKeyPem = pubKeyObjCrypto.export({ type: 'spki', format: 'pem' }).toString();
             }
-
-            // 解析公钥 PEM 为 forge 对象
             publicKeyObj = pki.publicKeyFromPem(pubKeyPem);
             csr.publicKey = publicKeyObj;
-
-            // 设置属性
-            const attrs = [{
-                name: 'commonName',
-                value: domains[0]
-            }];
-
-            if (domains.length > 1) {
-                attrs.push({
-                    name: 'subjectAltName',
-                    altNames: domains.slice(1).map(d => ({
-                        type: 2, // DNS
-                        value: d
-                    }))
-                });
-            }
+            const attrs = [{ name: 'commonName', value: domains[0] }];
+            if (domains.length > 1) attrs.push({ name: 'subjectAltName', altNames: domains.slice(1).map(d => ({ type: 2, value: d })) });
             csr.setSubject(attrs);
-
-            // ✅ 关键：使用 SHA-256 签名
             csr.sign(privateKey, forge.md.sha256.create());
-
-            const csrPem = pki.certificationRequestToPem(csr);
-            resolve(csrPem);
-        } catch (err) {
-            reject(err);
-        }
+            resolve(pki.certificationRequestToPem(csr));
+        } catch (err) { reject(err); }
     });
 }
 
+// ================= 核心业务：完整申请流程函数（关键修复：可复用） =================
+async function runFullAcmeFlow(kv, sessionId, oldPrivateKey = null) {
+    simpleLog(sessionId, '开始完整ACME流程');
+    let sess = await getSessionSafe(kv, sessionId);
+    if (!sess) throw new Error('会话不存在');
+
+    const { emails, domains, mode, envType, keyType, isRenewal } = sess.config;
+    const isStaging = envType === 'staging';
+    const taskCleanEmails = emails;
+    const taskCleanDomains = domains;
+
+    // 1. 连接ACME服务器
+    sess.stage = STAGE.KEY_GEN;
+    sess.status = 'processing';
+    await kv.put(sessionId, sess);
+    sess = await log(sessionId, 'step', '开始处理 (队列就绪)', '连接 ACME 服务器...');
+    if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+
+    const directoryUrl = isStaging ? acme.directory.letsencrypt.staging : acme.directory.letsencrypt.production;
+    const accountKey = await acme.crypto.createPrivateKey();
+    sess.accountKeyPem = accountKey.toString();
+    await kv.put(sessionId, sess);
+
+    // 2. 注册账户
+    sess.stage = STAGE.ACCOUNT_REG;
+    await kv.put(sessionId, sess);
+    sess = await log(sessionId, 'step', 'ACME 客户端已连接', '注册账户...');
+    if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+
+    const client = new acme.Client({ directoryUrl, accountKey });
+    await client.createAccount({
+        termsOfServiceAgreed: true,
+        contact: taskCleanEmails.map(e => `mailto:${e}`)
+    });
+    sess = await log(sessionId, 'success', '账户注册成功', '处理密钥...');
+    if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+
+    // 3. 生成/加载密钥
+    sess.stage = STAGE.KEY_GEN;
+    await kv.put(sessionId, sess);
+    let keyObj = null;
+    let privateKeyPem = null;
+
+    if (isRenewal && oldPrivateKey) {
+        const cleanInput = (typeof oldPrivateKey === 'string') ? oldPrivateKey.trim() : "";
+        const looksLikeKey = cleanInput.length > 50 && cleanInput.includes('PRIVATE KEY') && cleanInput.startsWith('-----BEGIN');
+        if (looksLikeKey) {
+            sess = await log(sessionId, 'step', '检测到有效的旧私钥', '验证并加载...');
+            if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+            keyObj = getValidatedKeyObject(cleanInput, keyType);
+            if (keyObj) {
+                privateKeyPem = keyObj.export({ format: 'pem', type: 'pkcs8' });
+                sess = await log(sessionId, 'success', '旧私钥加载成功', '将复用此密钥');
+                if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+            } else {
+                sess = await log(sessionId, 'warn', '旧私钥验证失败', '将生成新密钥');
+                if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+            }
+        }
+    }
+
+    if (!keyObj) {
+        try {
+            let generatedPair;
+            if (keyType === 'rsa-2048') generatedPair = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+            else if (keyType === 'rsa-3072') generatedPair = crypto.generateKeyPairSync('rsa', { modulusLength: 3072 });
+            else if (keyType === 'ecdsa-p256') generatedPair = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+            else throw new Error('未知的密钥类型');
+            keyObj = generatedPair.privateKey;
+            privateKeyPem = keyObj.export({ format: 'pem', type: 'pkcs8' });
+            sess = await log(sessionId, 'info', `已生成新密钥 (${keyType})`, '生成 CSR...');
+            if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+        } catch (genErr) { throw new Error(`密钥生成失败: ${genErr.message}`); }
+    }
+
+    sess.privateKeyPem = privateKeyPem;
+    await kv.put(sessionId, sess);
+
+    // 4. 生成CSR
+    let csr;
+    if (forge) {
+        sess = await log(sessionId, 'step', '使用 node-forge (SHA-256) 生成 CSR...', '兼容 OpenSSL 3');
+        if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+        try {
+            csr = await generateCsrManual(taskCleanDomains, privateKeyPem, keyType);
+        } catch (forgeErr) {
+            sess = await log(sessionId, 'warn', 'node-forge 生成失败，尝试 acme-client 默认方法', forgeErr.message);
+            if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+            const details = keyObj.asymmetricKeyDetails || {};
+            const exportOpts = details.type === 'rsa' ? { type: 'pkcs1', format: 'pem' } : { type: 'sec1', format: 'pem' };
+            const fallbackPem = keyObj.export(exportOpts);
+            csr = await acme.crypto.createCsr({ commonName: taskCleanDomains[0], altNames: taskCleanDomains.slice(1) }, fallbackPem);
+        }
+    } else {
+        sess = await log(sessionId, 'warn', '未找到 node-forge，使用 acme-client 默认方法 (风险较高)');
+        if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+        const details = keyObj.asymmetricKeyDetails || {};
+        const exportOpts = details.type === 'rsa' ? { type: 'pkcs1', format: 'pem' } : { type: 'sec1', format: 'pem' };
+        const pemStr = keyObj.export(exportOpts);
+        csr = await acme.crypto.createCsr({ commonName: taskCleanDomains[0], altNames: taskCleanDomains.slice(1) }, pemStr);
+    }
+
+    sess.csr = csr;
+    await kv.put(sessionId, sess);
+
+    // 5. 创建订单
+    sess.stage = STAGE.ORDER_CREATE;
+    await kv.put(sessionId, sess);
+    sess = await log(sessionId, 'step', 'CSR 生成完毕', '提交订单...');
+    if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+
+    const identifiers = taskCleanDomains.map(d => ({ type: 'dns', value: d }));
+    const order = await client.createOrder({ identifiers });
+    sess.orderUrl = order.url;
+    await kv.put(sessionId, sess);
+
+    // 6. 准备挑战
+    sess.stage = STAGE.CHALLENGE_PREPARE;
+    await kv.put(sessionId, sess);
+    sess = await log(sessionId, 'step', '订单已创建', '获取授权挑战...');
+    if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+
+    const authorizations = await client.getAuthorizations(order);
+    if (!authorizations.length) throw new Error('未获取到授权信息');
+
+    const challengesToSolve = [];
+    for (const auth of authorizations) {
+        const domain = auth.identifier.value;
+        let challenge = null;
+        if (mode === 'http-01') challenge = auth.challenges.find(c => c.type === 'http-01');
+        else challenge = auth.challenges.find(c => c.type === 'dns-01');
+        if (!challenge) throw new Error(`域名 ${domain} 找不到 ${mode} 挑战`);
+
+        const keyAuth = await client.getChallengeKeyAuthorization(challenge);
+        challengesToSolve.push({
+            domain, type: mode, token: challenge.token, keyAuthorization: keyAuth,
+            challengeUrl: challenge.url, authorizationUrl: auth.url,
+            display: mode === 'http-01' ? {
+                url: `http://${domain}/.well-known/acme-challenge/${challenge.token}`,
+                content: keyAuth
+            } : {
+                recordName: `_acme-challenge.${domain}`,
+                recordValue: keyAuth
+            }
+        });
+    }
+
+    sess.challengeData = challengesToSolve;
+    sess.stage = STAGE.WAITING_USER;
+    sess.status = 'waiting_user';
+    await kv.put(sessionId, sess);
+    await log(sessionId, 'step', '挑战数据已就绪', `请配置 ${challengesToSolve.length} 个验证记录。`);
+    simpleLog(sessionId, '完整ACME流程完成，等待用户验证');
+}
+
+// ================= 核心业务：验证流程函数（可复用） =================
+async function runVerificationFlow(kv, sessionId) {
+    simpleLog(sessionId, '开始验证流程');
+    let sess = await getSessionSafe(kv, sessionId);
+    if (!sess) throw new Error('会话不存在');
+
+    // 检查必要数据
+    if (!sess.config || !sess.challengeData || !sess.accountKeyPem || !sess.orderUrl) {
+        throw new Error('会话数据不完整，请重新申请');
+    }
+
+    sess.stage = STAGE.VERIFYING;
+    sess.status = 'processing';
+    await kv.put(sessionId, sess);
+    sess = await log(sessionId, 'step', '开始验证流程', '重建ACME客户端...');
+    if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+
+    const isStaging = sess.config.envType === 'staging';
+    const directoryUrl = isStaging ? acme.directory.letsencrypt.staging : acme.directory.letsencrypt.production;
+    const client = new acme.Client({ directoryUrl, accountKey: sess.accountKeyPem });
+    const order = await client.getOrder({ url: sess.orderUrl });
+    const challenges = sess.challengeData;
+
+    sess = await log(sessionId, 'step', 'ACME客户端重建成功', '提交挑战...');
+    if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+
+    // 提交挑战
+    for (const item of challenges) {
+        sess = await log(sessionId, 'step', `提交 ${item.domain} 挑战`, '等待 LE 响应...');
+        if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+        
+        try {
+            const challenge = await client.getChallenge({ url: item.challengeUrl });
+            if (challenge.status !== 'valid') {
+                await client.completeChallenge(challenge);
+            } else {
+                await log(sessionId, 'info', `${item.domain} 挑战已验证`, '跳过重复提交');
+            }
+        } catch (challengeErr) {
+            await log(sessionId, 'warn', `${item.domain} 挑战获取异常`, '尝试继续...', challengeErr.message);
+        }
+    }
+
+    sess = await log(sessionId, 'info', '所有挑战已提交', '轮询状态...');
+    if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+
+    // 轮询验证状态
+    const freshAuthorizations = await client.getAuthorizations(order);
+    const authMap = new Map();
+    freshAuthorizations.forEach(auth => authMap.set(auth.identifier.value, auth));
+    
+    for (const item of challenges) {
+        const auth = authMap.get(item.domain);
+        if (!auth) {
+            await log(sessionId, 'warn', `找不到 ${item.domain} 的授权信息`, '尝试继续...');
+            continue;
+        }
+        
+        sess = await log(sessionId, 'step', `等待 ${item.domain} 验证`, '轮询中...');
+        if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+        
+        if (auth.status === 'valid') {
+            await log(sessionId, 'success', `${item.domain} 已验证通过`, '继续...');
+            continue;
+        }
+        
+        await client.waitForValidStatus(auth, 90000);
+        sess = await log(sessionId, 'success', `${item.domain} 验证通过`, '继续...');
+        if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+    }
+
+    // 签发证书
+    sess.stage = STAGE.ISSUING;
+    await kv.put(sessionId, sess);
+    sess = await log(sessionId, 'success', '所有验证通过！', '签发证书...');
+    if (!sess) { sess = await getSessionSafe(kv, sessionId); if (!sess) return; }
+
+    let finalizedOrder;
+    try {
+        const currentOrder = await client.getOrder({ url: sess.orderUrl });
+        if (currentOrder.status === 'ready') {
+            finalizedOrder = await client.finalizeOrder(currentOrder, sess.csr, 60000);
+        } else if (currentOrder.status === 'processing' || currentOrder.status === 'valid') {
+            finalizedOrder = currentOrder;
+        } else {
+            throw new Error(`订单状态异常: ${currentOrder.status}`);
+        }
+    } catch (finalizeErr) {
+        await log(sessionId, 'warn', '订单提交异常，尝试直接获取证书...', finalizeErr.message);
+        finalizedOrder = await client.getOrder({ url: sess.orderUrl });
+    }
+
+    const cert = await client.getCertificate(finalizedOrder);
+    if (!cert) throw new Error('证书获取失败，请稍后重试');
+
+    sess = await getSessionSafe(kv, sessionId);
+    if (!sess) return;
+    
+    sess.certificate = cert;
+    sess.stage = STAGE.COMPLETED;
+    sess.status = 'completed';
+    await kv.put(sessionId, sess);
+    await log(sessionId, 'success', '证书签发成功！', '可查看或下载');
+    simpleLog(sessionId, '验证流程完成，证书已签发');
+}
+
+// ================= API路由 =================
+
+// --- 1. 创建会话 ---
 app.post('/api/create-session', async (req, res) => {
+    const kv = await getKV();
     const { emails, domains, mode, envType, keyType, isRenewal, oldPrivateKey } = req.body;
 
     if (!emails) return res.status(400).json({ error: '邮箱不能为空' });
@@ -176,239 +639,244 @@ app.post('/api/create-session', async (req, res) => {
     if (!allowedKeys.includes(keyType)) return res.status(400).json({ error: '不支持的密钥类型' });
 
     const sessionId = createSessionId();
-    const isStaging = envType === 'staging';
-
     const session = {
         id: sessionId,
         config: { domains: cleanDomains, emails: cleanEmails, mode, envType, keyType, isRenewal: !!isRenewal },
         status: 'queueing',
+        stage: STAGE.INIT, // 关键修复：记录阶段
         lastActive: Date.now(),
         logs: [],
-        client: null,
-        privateKeyObject: null,
+        accountKeyPem: null,
+        privateKeyPem: null,
         csr: null,
-        order: null,
+        orderUrl: null,
         challengeData: null,
-        certificate: null
+        certificate: null,
+        oldPrivateKeyTemp: isRenewal ? oldPrivateKey : null // 临时保存旧私钥，供重新验证时使用
     };
 
-    sessions.set(sessionId, session);
-    log(session, 'info', '请求已接收', '正在排队等待处理...');
-
+    await kv.put(sessionId, session);
+    await log(sessionId, 'info', '请求已接收', '正在排队等待处理...');
     res.json({ success: true, sessionId, message: '请求已加入队列，请查看日志进度' });
 
+    // 后台执行完整流程
     enqueueTask(async () => {
         try {
-            session.status = 'processing';
-            log(session, 'step', '开始处理 (队列就绪)', '连接 ACME 服务器...');
-
-            const directoryUrl = isStaging ? acme.directory.letsencrypt.staging : acme.directory.letsencrypt.production;
-
-            session.client = new acme.Client({
-                directoryUrl,
-                accountKey: await acme.crypto.createPrivateKey()
-            });
-            log(session, 'step', 'ACME 客户端已连接', '注册账户...');
-
-            await session.client.createAccount({
-                termsOfServiceAgreed: true,
-                contact: cleanEmails.map(e => `mailto:${e}`)
-            });
-            log(session, 'success', '账户注册成功', '处理密钥...');
-
-            let keyObj = null;
-            let privateKeyPem = null;
-
-            // 1. 处理续期
-            if (isRenewal && oldPrivateKey) {
-                const cleanInput = (typeof oldPrivateKey === 'string') ? oldPrivateKey.trim() : "";
-                const looksLikeKey = cleanInput.length > 50 && cleanInput.includes('PRIVATE KEY') && cleanInput.startsWith('-----BEGIN');
-
-                if (looksLikeKey) {
-                    log(session, 'step', '检测到有效的旧私钥', '验证并加载...');
-                    keyObj = getValidatedKeyObject(cleanInput, keyType);
-                    if (keyObj) {
-                        privateKeyPem = keyObj.export({ format: 'pem', type: 'pkcs8' });
-                        log(session, 'success', '旧私钥加载成功', '将复用此密钥');
-                    } else {
-                        log(session, 'warn', '旧私钥验证失败', '将生成新密钥');
-                    }
-                } else {
-                    if (cleanInput.length > 0) log(session, 'info', '续期框内容无效', '忽略并生成新密钥');
-                    else log(session, 'info', '续期模式但未提供旧私钥', '生成全新密钥对');
-                }
-            }
-
-            // 2. 生成新私钥
-            if (!keyObj) {
-                try {
-                    let generatedPair;
-                    if (keyType === 'rsa-2048') {
-                        generatedPair = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
-                    } else if (keyType === 'rsa-3072') {
-                        generatedPair = crypto.generateKeyPairSync('rsa', { modulusLength: 3072 });
-                    } else if (keyType === 'ecdsa-p256') {
-                        generatedPair = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-                    } else {
-                        throw new Error('未知的密钥类型');
-                    }
-                    keyObj = generatedPair.privateKey;
-                    privateKeyPem = keyObj.export({ format: 'pem', type: 'pkcs8' });
-                    log(session, 'info', `已生成新密钥 (${keyType})`, '生成 CSR...');
-                } catch (genErr) {
-                    throw new Error(`密钥生成失败: ${genErr.message}`);
-                }
-            }
-
-            session.privateKeyObject = keyObj;
-
-            // 3. 生成 CSR (Node v24 专用路径)
-            let csr;
-            if (forge) {
-                log(session, 'step', '使用 node-forge (SHA-256) 生成 CSR...', '兼容 OpenSSL 3');
-                try {
-                    csr = await generateCsrManual(cleanDomains, privateKeyPem, keyType);
-                } catch (forgeErr) {
-                    log(session, 'warn', 'node-forge 生成失败，尝试 acme-client 默认方法', forgeErr.message);
-                    // Fallback
-                    const details = keyObj.asymmetricKeyDetails || {};
-                    const exportOpts = details.type === 'rsa' ? { type: 'pkcs1', format: 'pem' } : { type: 'sec1', format: 'pem' };
-                    const fallbackPem = keyObj.export(exportOpts);
-                    csr = await acme.crypto.createCsr({ commonName: cleanDomains[0], altNames: cleanDomains.slice(1) }, fallbackPem);
-                }
-            } else {
-                log(session, 'warn', '未找到 node-forge，使用 acme-client 默认方法 (风险较高)');
-                const details = keyObj.asymmetricKeyDetails || {};
-                const exportOpts = details.type === 'rsa' ? { type: 'pkcs1', format: 'pem' } : { type: 'sec1', format: 'pem' };
-                const pemStr = keyObj.export(exportOpts);
-                csr = await acme.crypto.createCsr({ commonName: cleanDomains[0], altNames: cleanDomains.slice(1) }, pemStr);
-            }
-
-            session.csr = csr;
-            log(session, 'step', 'CSR 生成完毕', '提交订单...');
-
-            const identifiers = cleanDomains.map(d => ({ type: 'dns', value: d }));
-            session.order = await session.client.createOrder({ identifiers });
-            log(session, 'step', '订单已创建', '获取授权挑战...');
-
-            const authorizations = await session.client.getAuthorizations(session.order);
-            if (!authorizations.length) throw new Error('未获取到授权信息');
-
-            const challengesToSolve = [];
-            for (const auth of authorizations) {
-                const domain = auth.identifier.value;
-                let challenge = null;
-                if (mode === 'http-01') challenge = auth.challenges.find(c => c.type === 'http-01');
-                else challenge = auth.challenges.find(c => c.type === 'dns-01');
-
-                if (!challenge) throw new Error(`域名 ${domain} 找不到 ${mode} 挑战`);
-
-                const keyAuth = await session.client.getChallengeKeyAuthorization(challenge);
-
-                challengesToSolve.push({
-                    domain, type: mode, token: challenge.token, keyAuthorization: keyAuth,
-                    challengeObj: challenge, authorizationObj: auth,
-                    display: mode === 'http-01' ? {
-                        url: `http://${domain}/.well-known/acme-challenge/${challenge.token}`,
-                        content: keyAuth
-                    } : {
-                        recordName: `_acme-challenge.${domain}`,
-                        recordValue: keyAuth
-                    }
-                });
-            }
-
-            session.challengeData = challengesToSolve;
-            session.status = 'waiting_user';
-            log(session, 'step', '挑战数据已就绪', `请配置 ${challengesToSolve.length} 个验证记录。`);
-
+            await runFullAcmeFlow(kv, sessionId, oldPrivateKey);
         } catch (err) {
-            session.status = 'failed';
-            log(session, 'error', `初始化失败: ${err.message}`, '请重试', err.stack);
+            console.error(`[任务失败] 会话 ${sessionId}:`, err.message);
+            let sess = await getSessionSafe(kv, sessionId);
+            if (sess) {
+                sess.status = 'failed';
+                sess.stage = STAGE.FAILED;
+                await kv.put(sessionId, sess);
+                await log(sessionId, 'error', `初始化失败: ${err.message}`, '请点击重新验证重试', err.stack);
+            }
         }
-    }).catch(err => {
-        session.status = 'failed';
-        log(session, 'error', `系统繁忙: ${err.message}`, '请稍后重试');
+    }).catch(async (err) => {
+        console.error(`[任务异常] 会话 ${sessionId}:`, err.message);
+        let sess = await getSessionSafe(kv, sessionId);
+        if (sess) {
+            sess.status = 'failed';
+            sess.stage = STAGE.FAILED;
+            await kv.put(sessionId, sess);
+            await log(sessionId, 'error', `系统繁忙: ${err.message}`, '请稍后重试');
+        }
     });
 });
 
+// --- 2. 验证接口（关键修复：智能判断重新验证逻辑） ---
 app.post('/api/verify', async (req, res) => {
+    const kv = await getKV();
     const { sessionId } = req.body;
-    const session = sessions.get(sessionId);
+    const session = await getSessionSafe(kv, sessionId);
     if (!session) return res.status(404).json({ error: '会话不存在' });
-    if (session.status !== 'waiting_user') return res.status(400).json({ error: `当前状态不可验证: ${session.status}` });
+
+    // 明确状态限制
+    const allowedStatuses = ['waiting_user', 'failed'];
+    if (!allowedStatuses.includes(session.status)) {
+        return res.status(400).json({ 
+            error: `当前状态不可验证: ${session.status}`,
+            currentStatus: session.status,
+            currentStage: session.stage,
+            allowedStatuses: allowedStatuses,
+            hint: '请等待处理完成或重新申请'
+        });
+    }
+
+    // 关键修复：判断失败阶段，决定是「从头开始」还是「继续验证」
+    let action = '';
+    let isFullRetry = false;
+
+    if (session.status === 'failed') {
+        // 判断是否有足够的数据继续验证
+        const hasChallengeData = session.challengeData && session.challengeData.length > 0;
+        const hasOrderUrl = !!session.orderUrl;
+        const hasAccountKey = !!session.accountKeyPem;
+
+        if (hasChallengeData && hasOrderUrl && hasAccountKey) {
+            // 验证阶段失败：继续验证
+            action = '继续验证流程';
+            session.status = 'waiting_user';
+            session.stage = STAGE.WAITING_USER;
+        } else {
+            // 早期阶段失败：重新走完整流程
+            action = '重新生成密钥并创建订单';
+            isFullRetry = true;
+            session.status = 'queueing';
+            session.stage = STAGE.INIT;
+            // 清理不完整的数据
+            session.accountKeyPem = null;
+            session.privateKeyPem = null;
+            session.csr = null;
+            session.orderUrl = null;
+            session.challengeData = null;
+            session.certificate = null;
+        }
+    } else {
+        // waiting_user 状态：正常验证
+        action = '开始验证';
+    }
 
     session.lastActive = Date.now();
-    log(session, 'info', '验证请求已接收', '加入验证队列...');
+    await kv.put(sessionId, session);
+    
+    // 记录重新验证的日志（关键修复：确保有日志）
+    await log(sessionId, 'info', `点击重新验证`, action);
+    res.json({ 
+        success: true, 
+        message: `${action}，任务已加入队列`, 
+        isFullRetry: isFullRetry,
+        action: action
+    });
 
+    // 后台执行对应流程
     enqueueTask(async () => {
         try {
-            log(session, 'step', '开始验证流程', '提交挑战...');
-            const challenges = session.challengeData;
-            for (const item of challenges) {
-                log(session, 'step', `提交 ${item.domain} 挑战`, '等待 LE 响应...');
-                await session.client.completeChallenge(item.challengeObj);
+            if (isFullRetry) {
+                // 重新走完整流程
+                await log(sessionId, 'step', '检测到早期阶段失败', '重新开始完整流程...');
+                await runFullAcmeFlow(kv, sessionId, session.oldPrivateKeyTemp);
+            } else {
+                // 继续验证流程
+                await runVerificationFlow(kv, sessionId);
             }
-            log(session, 'info', '所有挑战已提交', '轮询状态...');
-            const freshAuthorizations = await session.client.getAuthorizations(session.order);
-            const authMap = new Map();
-            freshAuthorizations.forEach(auth => authMap.set(auth.identifier.value, auth));
-            for (const item of challenges) {
-                const auth = authMap.get(item.domain);
-                if (!auth) throw new Error(`找不到 ${item.domain} 的授权`);
-                log(session, 'step', `等待 ${item.domain} 验证`, '轮询中...');
-                await session.client.waitForValidStatus(auth, 90000);
-                log(session, 'success', `${item.domain} 验证通过`, '继续...');
-            }
-            log(session, 'success', '所有验证通过！', '签发证书...');
-            const finalized = await session.client.finalizeOrder(session.order, session.csr, 60000);
-            const cert = await session.client.getCertificate(finalized);
-            session.certificate = cert;
-            session.status = 'completed';
-            log(session, 'success', '证书签发成功！', '可查看或下载');
         } catch (err) {
-            let errMsg = err.message;
-            if (errMsg.includes('Timeout')) errMsg = '验证超时。';
-            if (errMsg.includes('invalid') || errMsg.includes('CSR')) errMsg = '验证失败或 CSR 错误。请确保已安装 node-forge (npm install node-forge)。';
-            log(session, 'error', `验证出错: ${errMsg}`, '修正后可重试');
+            console.error(`[验证任务失败] 会话 ${sessionId}:`, err.message);
+            let sess = await getSessionSafe(kv, sessionId);
+            if (sess) {
+                let errMsg = err.message;
+                if (errMsg.includes('Timeout')) errMsg = '验证超时，请检查DNS/HTTP记录配置后重试';
+                if (errMsg.includes('invalid') || errMsg.includes('CSR')) errMsg = '验证失败或 CSR 错误。请确保已安装 node-forge (npm install node-forge)。';
+                if (errMsg.includes('order') || errMsg.includes('数据不完整')) errMsg = '流程数据异常，请点击重新验证（将重新生成密钥和订单）';
+                
+                sess.status = 'failed';
+                sess.stage = STAGE.FAILED;
+                await kv.put(sessionId, sess);
+                await log(sessionId, 'error', `验证出错: ${errMsg}`, '修正后可点击重新验证', err.stack);
+            }
         }
     });
-    res.json({ success: true, message: '验证任务已加入队列' });
 });
 
-app.get('/api/session/:id', (req, res) => {
-    const s = sessions.get(req.params.id);
-    if (!s) return res.status(404).json({ error: 'Not found' });
-    let pemKey = null;
-    if (s.privateKeyObject) {
-        try { pemKey = s.privateKeyObject.export({ format: 'pem', type: 'pkcs8' }); }
-        catch (e) { try { pemKey = s.privateKeyObject.export({ format: 'pem' }); } catch (e2) { pemKey = "Error"; } }
+// --- 3. 会话状态查询 ---
+app.get('/api/session-status/:id', async (req, res) => {
+    const kv = await getKV();
+    const s = await getSessionSafe(kv, req.params.id);
+    if (!s) return res.status(404).json({ error: '会话不存在' });
+
+    res.json({
+        status: s.status,
+        stage: s.stage, // 新增：返回当前阶段
+        canRetry: s.status === 'failed' || s.status === 'waiting_user',
+        canDownload: s.status === 'completed',
+        lastActive: s.lastActive,
+        message: getStatusMessage(s.status, s.stage),
+        // 新增：告诉前端是否需要重新走完整流程
+        needsFullRetry: s.status === 'failed' && (!s.challengeData || !s.orderUrl || !s.accountKeyPem)
+    });
+
+    function getStatusMessage(status, stage) {
+        if (status === 'failed') return '验证失败，请点击重新验证';
+        if (stage === STAGE.KEY_GEN) return '正在生成密钥对...';
+        if (stage === STAGE.ACCOUNT_REG) return '正在注册ACME账户...';
+        if (stage === STAGE.ORDER_CREATE) return '正在创建证书订单...';
+        if (stage === STAGE.CHALLENGE_PREPARE) return '正在准备验证挑战...';
+        if (stage === STAGE.WAITING_USER) return '等待您配置验证记录...';
+        if (stage === STAGE.VERIFYING) return '正在验证您的配置...';
+        if (stage === STAGE.ISSUING) return '正在签发证书...';
+        if (status === 'queueing') return '请求正在排队处理中...';
+        if (status === 'processing') return '正在处理您的请求...';
+        if (status === 'completed') return '证书签发成功！';
+        return '未知状态';
     }
-    res.json({ status: s.status, logs: s.logs, config: s.config, hasCert: !!s.certificate, certificate: s.certificate, privateKey: pemKey, challenges: s.challengeData });
 });
 
-app.get('/download/cert/:id', (req, res) => {
-    const s = sessions.get(req.params.id);
+// --- 4. 会话详情 ---
+app.get('/api/session/:id', async (req, res) => {
+    const kv = await getKV();
+    const s = await getSessionSafe(kv, req.params.id);
+    if (!s) return res.status(404).json({ error: 'Not found' });
+
+    res.json({
+        status: s.status,
+        stage: s.stage,
+        logs: s.logs,
+        config: s.config,
+        hasCert: !!s.certificate,
+        certificate: s.certificate,
+        privateKey: s.privateKeyPem,
+        challenges: s.challengeData
+    });
+});
+
+// --- 5. 下载证书 ---
+app.get('/api/download/cert/:id', async (req, res) => {
+    const kv = await getKV();
+    const s = await getSessionSafe(kv, req.params.id);
     if (!s || !s.certificate) return res.status(404).send('Not Found');
     res.setHeader('Content-Type', 'application/x-x509-ca-cert');
     res.setHeader('Content-Disposition', `attachment; filename="${s.config.domains[0].replace(/[^a-z0-9]/gi, '_')}.crt"`);
     res.send(s.certificate);
 });
 
-app.get('/download/key/:id', (req, res) => {
-    const s = sessions.get(req.params.id);
-    if (!s || !s.privateKeyObject) return res.status(404).send('Not Found');
-    let pemKey;
-    try { pemKey = s.privateKeyObject.export({ format: 'pem', type: 'pkcs8' }); }
-    catch (e) { pemKey = s.privateKeyObject.export({ format: 'pem' }); }
+// --- 6. 下载密钥 ---
+app.get('/api/download/key/:id', async (req, res) => {
+    const kv = await getKV();
+    const s = await getSessionSafe(kv, req.params.id);
+    if (!s || !s.privateKeyPem) return res.status(404).send('Not Found');
     res.setHeader('Content-Type', 'application/x-pem-file');
     res.setHeader('Content-Disposition', `attachment; filename="${s.config.domains[0].replace(/[^a-z0-9]/gi, '_')}.key"`);
-    res.send(pemKey);
+    res.send(s.privateKeyPem);
 });
 
-app.listen(PORT, () => {
-    console.log(`🔒 Production LE Tool Running on ${PORT}`);
-    console.log(`✅ Fixed: Variable redeclaration error in CSR generation`);
-    if (!forge) console.log(`⚠️  WARNING: node-forge not found.`);
-    else console.log(`✅ node-forge loaded successfully.`);
+// --- 7. 404 ---
+app.use((req, res) => {
+    console.log(`404 - ${req.method} ${req.originalUrl} - 运行环境: ${currentRuntime}`);
+    res.status(404).json({
+        error: 'API路径不存在',
+        path: req.originalUrl,
+        runtime: currentRuntime
+    });
 });
+
+// ================= 全平台入口 =================
+if (isLocal) {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`🔒 ACME证书工具已启动，本地访问地址: http://0.0.0.0:${PORT}`);
+        console.log(`✅ 当前运行环境: ${currentRuntime}`);
+        if (!forge) console.log(`⚠️  警告: node-forge 未安装，Node v24+ 环境可能出现CSR生成失败`);
+        else console.log(`✅ node-forge 加载成功`);
+    });
+}
+
+const handler = serverless(app, {
+    provider: currentRuntime === RUNTIME.ALIYUN_ESA ? 'aliyun' : currentRuntime === RUNTIME.TENCENT_EO ? 'tencent' : 'aws'
+});
+module.exports.handler = handler;
+
+if (currentRuntime === RUNTIME.CLOUDFLARE) {
+    addEventListener('fetch', (event) => {
+        event.respondWith(handler(event.request));
+    });
+}

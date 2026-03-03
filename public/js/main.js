@@ -519,7 +519,7 @@ function startPollingOptimized() {
                     renderChallenges(data.challenges, data.config.mode);
                     document.getElementById('action-info').innerHTML = `
                         <strong>请为以下 ${data.challenges.length} 个域名配置验证记录</strong><br>
-                        配置完成后，点击下方"开始验证"按钮。DNS记录生效可能需要几分钟（TTL影响）。提交验证前先确认DNS是否已经生效，用cmd执行这条命令确认返回值是否一致 nslookup -qt=txt DNS主机记录
+                        配置完成后，点击下方"开始验证"按钮。DNS记录生效可能需要几分钟（TTL影响）。提交验证前先确认DNS是否已经生效，用cmd执行这条命令确认返回值是否一致 nslookup -qt=txt ${escapeHtml(data.display.recordName)}
                     `;
                     // 启用验证按钮
                     document.getElementById('verifyBtn').disabled = false;
