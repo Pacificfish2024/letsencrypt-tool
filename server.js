@@ -174,7 +174,7 @@ class NativeKV extends BaseKV {
 class CloudflareKV extends BaseKV {
     constructor() {
         super();
-        this.kvBindingName = process.env.CF_KV_BINDING || 'ACME_KV';
+        this.kvBindingName = process.env.CF_KV_BINDING || 'ssl';
         this.kv = globalThis[this.kvBindingName];
     }
 
