@@ -10,4 +10,5 @@
 直接部署，自带依赖，无需安装其他软件。
 函数入口server.js
 访问WEB 127.0.0.1:3000
+demo:https://ssl.xianyugo.com/
 功能建议和BUG反馈=》pacificfish@foxmail.com
